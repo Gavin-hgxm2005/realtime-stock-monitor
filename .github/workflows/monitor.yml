@@ -1,1 +1,27 @@
+name: 深科技异动监控
 
+on:
+  schedule:
+    # UTC时间，北京时间 = UTC+8
+    # 交易时段 9:25-11:35, 12:55-15:05 (北京时间)
+    # 对应 UTC 1:25-3:35, 4:55-7:05
+    # 每15分钟运行一次，周一到周五
+    - cron: '0,15,30,45 1,2,3,5,6,7 * * 1-5'
+  workflow_dispatch: # 支持手动触发测试
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 运行监控脚本
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python monitor.py
