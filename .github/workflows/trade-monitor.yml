@@ -1,0 +1,27 @@
+name: 实时交易监控
+
+on:
+  schedule:
+    # UTC时间，北京时间 = UTC+8
+    # 交易时段 9:00-15:30 (北京时间)，对应 UTC 1:00-7:30
+    # 每5分钟运行一次，周一到周五
+    - cron: '*/5 1,2,3,4,5,6,7 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 运行实时交易监控
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python monitor.py --mode trade
