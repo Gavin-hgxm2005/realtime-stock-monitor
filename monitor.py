@@ -1,45 +1,55 @@
 #!/usr/bin/env python3
 """
-19只A股异动监控脚本
-数据源：新浪财经(主) + 东方财富(辅)
+19只A股异动监控脚本（双模式）
+数据源：新浪财经(主行情) + 东方财富(资金/公告/龙虎榜) + 巨潮资讯网(公告补充)
 推送通道：企业微信群机器人(主) / Server酱(备)
-部署方式：GitHub Actions 定时运行
+部署方式：GitHub Actions 定时运行 / WorkBuddy 本地自动化
+
+用法:
+  python monitor.py --mode trade   # 实时交易监控（交易日9:00-15:30）
+  python monitor.py --mode news    # 公告/龙虎榜消息面监控（全天）
 """
 
 import json
 import urllib.request
 import urllib.parse
 import os
+import sys
+import re
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# ============ 配置 ============
-# 监控股票列表（自动解析交易所）
+# ============ 配 ============
+# 监控股票列表（含巨潮资讯网 orgId 和板块）
+# 字段: (代码, 名称, 巨潮orgId, 巨潮板块)
 STOCKS = [
-    ("SH600602", "云赛智联"),
-    ("SZ000636", "风华高科"),
-    ("SZ001248", "华润新能"),
-    ("SH688825", "长鑫科技"),
-    ("SZ001270", "铖昌科技"),
-    ("SZ000021", "深科技"),
-    ("SZ002384", "东山精密"),
-    ("SH600584", "长电科技"),
-    ("SZ300274", "阳光电源"),
-    ("SZ002050", "三花智控"),
-    ("SZ300502", "新易盛"),
-    ("SZ002281", "光迅科技"),
-    ("SH688019", "安集科技"),
-    ("SH603986", "兆易创新"),
-    ("SZ300450", "先导智能"),
-    ("SZ300073", "当升科技"),
-    ("SZ000333", "美的集团"),
-    ("SH603259", "药明康德"),
-    ("SZ002463", "沪电股份"),
+    ("SH600602", "云赛智联", "gssh0600602", "sse"),
+    ("SZ000636", "风华高科", "gssz0000636", "szse"),
+    ("SZ001248", "华润新能", "9900062481", "szse"),
+    ("SH688825", "长鑫科技", "9920000008", "sse"),
+    ("SZ001270", "铖昌科技", "9900052541", "szse"),
+    ("SZ000021", "深科技", "gssz0000021", "szse"),
+    ("SZ002384", "东山精密", "9900011647", "szse"),
+    ("SH600584", "长电科技", "gssh0600584", "sse"),
+    ("SZ300274", "阳光电源", "9900021300", "szse"),
+    ("SZ002050", "三花智控", "gssz0002050", "szse"),
+    ("SZ300502", "新易盛", "9900026455", "szse"),
+    ("SZ002281", "光迅科技", "9900007888", "szse"),
+    ("SH688019", "安集科技", "9900038987", "sse"),
+    ("SH603986", "兆易创新", "9900026561", "sse"),
+    ("SZ300450", "先导智能", "9900023846", "szse"),
+    ("SZ300073", "当升科技", "9900011167", "szse"),
+    ("SZ000333", "美的集团", "9900005965", "szse"),
+    ("SH603259", "药明康德", "9900035584", "sse"),
+    ("SZ002463", "沪电股份", "9900013929", "szse"),
 ]
 
 # 推送通道（优先级：企业微信群机器人 > Server酱）
 WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")
 SENDKEY = os.environ.get("SERVERCHAN_SENDKEY", "")
+
+# 去重状态文件（记录已推送的公告/龙虎榜，避免重复推送）
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "news_state.json")
 
 # 关键词：公告标题中出现这些词时视为重要利空利好
 IMPORTANT_KEYWORDS = [
@@ -47,7 +57,12 @@ IMPORTANT_KEYWORDS = [
     "质押", "冻结", "诉讼", "仲裁", "处分", "监管", "问询函",
     "重大资产", "重组", "收购", "合并", "分立", "停牌", "复牌",
     "分红", "派息", "送股", "转增", "激励", "行权",
+    "担保", "减持", "增持", "违规", "立案", "处罚",
+    "退市", "风险警示", "问询", "函", "审批", "核准",
 ]
+
+# 公告去重时间窗（分钟）：只推送最近N分钟内发布的公告
+ANNOUNCE_WINDOW_MIN = 40
 
 
 # ============ 工具函数 ============
@@ -99,10 +114,65 @@ def fetch_text(url, encoding="gbk", retries=3, delay=1):
                 return None
 
 
+def post_json(url, data, headers=None, retries=3, delay=1):
+    """带重试的 POST JSON 请求"""
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            resp = urllib.request.urlopen(req, timeout=15)
+            return json.loads(resp.read())
+        except Exception as e:
+            if i < retries - 1:
+                _time.sleep(delay)
+                delay += 1
+            else:
+                print(f"  [WARN] POST失败: {url[:80]}... -> {e}")
+                return None
+
+
+# ============ 去重状态 ============
+def load_state():
+    """加载已推送记录"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"pushed": {}}
+
+
+def save_state(state):
+    """保存状态文件"""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [WARN] 状态保存失败: {e}")
+
+
+def prune_state(state):
+    """清理7天前的记录"""
+    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    state["pushed"] = {k: v for k, v in state["pushed"].items() if v > cutoff}
+    return state
+
+
+def is_pushed(state, key):
+    return key in state.get("pushed", {})
+
+
+def mark_pushed(state, key):
+    state.setdefault("pushed", {})[key] = datetime.now().isoformat()
+
+
 # ============ 数据获取 ============
 def get_sina_quotes():
     """新浪批量实时行情，一次返回所有股票"""
-    symbols = [parse_code(code)[0] + parse_code(code)[1] for code, _ in STOCKS]
+    symbols = [parse_code(code)[0] + parse_code(code)[1] for code, _, _, _ in STOCKS]
     url = "https://hq.sinajs.cn/list=" + ",".join(symbols)
     content = fetch_text(url)
     if not content:
@@ -130,7 +200,6 @@ def get_sina_quotes():
         low = float(parts[5])
         volume_shares = int(parts[8])
 
-        # 买卖五档（指数10-18为买, 20-28为卖, 奇数位为价格）
         buy_vol = sum(int(parts[i]) for i in range(10, 20, 2))
         sell_vol = sum(int(parts[i]) for i in range(20, 30, 2))
 
@@ -172,10 +241,6 @@ def get_sina_kline(market, code):
             "high": float(item["high"]),
             "low": float(item["low"]),
             "volume": int(item["volume"]),
-            "ma5": item.get("ma_price5"),
-            "ma_vol5": item.get("ma_volume5"),
-            "ma10": item.get("ma_price10"),
-            "ma30": item.get("ma_price30"),
         })
     return klines
 
@@ -195,13 +260,9 @@ def get_fund_flow(secid):
             "main_net": d.get("f62", 0),
             "main_pct": d.get("f184", 0) / 100,
             "super_large_net": d.get("f66", 0),
-            "super_large_pct": d.get("f69", 0) / 100,
             "large_net": d.get("f72", 0),
-            "large_pct": d.get("f75", 0) / 100,
             "medium_net": d.get("f78", 0),
-            "medium_pct": d.get("f81", 0) / 100,
             "small_net": d.get("f84", 0),
-            "small_pct": d.get("f87", 0) / 100,
         }
     return None
 
@@ -220,55 +281,90 @@ def get_fund_flow_history(secid):
         flows = []
         for line in data["data"]["klines"]:
             parts = line.split(",")
-            flows.append({
-                "date": parts[0],
-                "main_net": float(parts[1]),
-            })
+            flows.append({"date": parts[0], "main_net": float(parts[1])})
         return flows
     return None
 
 
-def get_announcements(code):
-    """东方财富最新公告（5条）"""
+def get_announcements_eastmoney(code):
+    """东方财富最新公告，返回带art_code和eiTime的列表"""
     for protocol in ["https", "http"]:
         try:
             url = (
                 f"{protocol}://np-anotice-stock.eastmoney.com/api/security/ann"
-                f"?page_size=5&page_index=1&ann_type=A&stock_list={code}&f_node=0&s_node=0"
+                f"?page_size=10&page_index=1&ann_type=A&stock_list={code}&f_node=0&s_node=0"
             )
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Referer": "https://data.eastmoney.com/",
-                },
-            )
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://data.eastmoney.com/",
+            })
             resp = urllib.request.urlopen(req, timeout=10)
             data = json.loads(resp.read())
             if data and data.get("data") and data["data"].get("list"):
                 result = []
                 for item in data["data"]["list"]:
                     title = item.get("title", "")
-                    notice_date = item.get("notice_date", "")[:10]
-                    column_name = ""
-                    if item.get("columns"):
-                        column_name = item["columns"][0].get("column_name", "")
+                    art_code = item.get("art_code", "")
+                    ei_time = item.get("eiTime", "")[:19]
                     is_important = any(kw in title for kw in IMPORTANT_KEYWORDS)
                     result.append({
                         "title": title,
-                        "date": notice_date,
-                        "category": column_name,
+                        "art_code": art_code,
+                        "ei_time": ei_time,
                         "important": is_important,
+                        "source": "东财",
                     })
                 return result
         except Exception as e:
             if protocol == "http":
-                print(f"  [WARN] 公告接口异常: {e}")
+                print(f"  [WARN] 东财公告接口异常({code}): {e}")
     return []
 
 
+def get_announcements_cninfo(code, org_id, column):
+    """巨潮资讯网（证监会指定信息披露平台）最新公告"""
+    try:
+        url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+        post_data = urllib.parse.urlencode({
+            "pageNum": "1",
+            "pageSize": "10",
+            "column": column,
+            "tabName": "fulltext",
+            "stock": f"{code},{org_id}",
+            "seDate": "",
+        }).encode("utf-8")
+        result = post_json(url, post_data, headers={
+            "Referer": "https://www.cninfo.com.cn/",
+        })
+        if not result:
+            return []
+        anns = result.get("announcements") or []
+        out = []
+        for item in anns:
+            title = item.get("announcementTitle", "")
+            ann_id = item.get("announcementId", "")
+            ts_ms = item.get("announcementTime", 0)
+            if ts_ms:
+                ei = datetime.fromtimestamp(ts_ms / 1000)
+                ei_time = ei.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                ei_time = ""
+            is_important = any(kw in title for kw in IMPORTANT_KEYWORDS)
+            out.append({
+                "title": title,
+                "art_code": ann_id,
+                "ei_time": ei_time,
+                "important": is_important,
+                "source": "巨潮",
+            })
+        return out
+    except Exception as e:
+        print(f"  [WARN] 巨潮公告接口异常({code}): {e}")
+        return []
+
+
 def get_dragon_tiger(code):
-    """东方财富龙虎榜（检查是否上榜）"""
+    """东方财富龙虎榜"""
     url = (
         "https://datacenter-web.eastmoney.com/api/data/v1/get"
         "?sortColumns=TRADE_DATE&sortTypes=-1&pageSize=10&pageNumber=1"
@@ -285,8 +381,6 @@ def get_dragon_tiger(code):
                 "date": str(item.get("TRADE_DATE", ""))[:10],
                 "reason": item.get("EXPLAIN", ""),
                 "net_buy": item.get("NET_AMOUNT", 0),
-                "buy_amount": item.get("BUY_AMOUNT", 0),
-                "sell_amount": item.get("SELL_AMOUNT", 0),
             })
     return result
 
@@ -306,10 +400,9 @@ def calc_volume_ratio(quote, kline_history):
 
 
 # ============ 异动分析 ============
-def analyze_signals(quote, fund_flow, ff_history, vol_ratio, announcements=None, dragon_tiger=None):
-    """分析单只股票的异动信号"""
+def analyze_trade_signals(quote, fund_flow, ff_history, vol_ratio):
+    """分析实时交易类异动信号（5类，不含公告/龙虎榜）"""
     signals = []
-
     if not quote:
         return signals
 
@@ -319,9 +412,7 @@ def analyze_signals(quote, fund_flow, ff_history, vol_ratio, announcements=None,
     # 1. 涨跌幅异动 (|涨跌|>=5%)
     if abs(change_pct) >= 5:
         tag = "大跌" if change_pct < 0 else "大涨"
-        signals.append(
-            f"**{tag}异动**：当前价 {current:.2f}元，涨跌幅 {change_pct:+.2f}%"
-        )
+        signals.append(f"**{tag}异动**：当前价 {current:.2f}元，涨跌幅 {change_pct:+.2f}%")
 
     # 2. 量比异动
     if vol_ratio is not None:
@@ -335,9 +426,7 @@ def analyze_signals(quote, fund_flow, ff_history, vol_ratio, announcements=None,
         main_net = fund_flow["main_net"]
         if abs(main_net) >= 1e8:
             tag = "流入" if main_net > 0 else "流出"
-            signals.append(
-                f"**主力大额{tag}**：净{tag} {abs(main_net)/1e8:.2f}亿"
-            )
+            signals.append(f"**主力大额{tag}**：净{tag} {abs(main_net)/1e8:.2f}亿")
 
     # 4. 资金流向反转
     if fund_flow and ff_history and len(ff_history) >= 2:
@@ -368,31 +457,62 @@ def analyze_signals(quote, fund_flow, ff_history, vol_ratio, announcements=None,
                 f"买盘{buy_v/10000:.1f}万手 vs 卖盘{sell_v/10000:.1f}万手"
             )
 
-    # 6. 当天重要公告（仅今天的，标题含关键词）
-    if announcements:
-        today = datetime.now().date()
-        for ann in announcements:
-            try:
-                ann_date = datetime.strptime(ann["date"], "%Y-%m-%d").date()
-                if ann_date == today and ann.get("important"):
-                    signals.append(f"**重要公告**：{ann['title']}")
-            except (ValueError, KeyError):
-                pass
+    return signals
 
-    # 7. 当天龙虎榜上榜（仅今天的）
-    if dragon_tiger:
-        today = datetime.now().date()
-        for item in dragon_tiger:
+
+def merge_announcements(em_list, cn_list):
+    """合并东方财富和巨潮资讯的公告，按标题去重"""
+    seen_titles = set()
+    merged = []
+    for ann in em_list + cn_list:
+        title = ann.get("title", "")
+        # 标题去重：取较短的作为基准比较，去掉括号差异
+        title_key = re.sub(r"[（）()【】\[\]【】]", "", title).strip()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        merged.append(ann)
+    return merged
+
+
+def analyze_news_signals(announcements, dragon_tiger, stock_code, state):
+    """分析消息面异动信号（公告+龙虎榜），带去重"""
+    signals = []
+    now = datetime.now()
+
+    # 6. 重要公告（仅最近N分钟内发布的，且未推送过）
+    if announcements:
+        for ann in announcements:
+            if not ann.get("important"):
+                continue
             try:
-                lhb_date = datetime.strptime(item["date"], "%Y-%m-%d").date()
-                if lhb_date == today:
-                    net = item.get("net_buy", 0)
-                    net_str = f"净买入{abs(net)/1e8:.2f}亿" if net >= 0 else f"净卖出{abs(net)/1e8:.2f}亿"
-                    signals.append(
-                        f"**龙虎榜上榜**：{item.get('reason', '')}，{net_str}"
-                    )
+                ei = datetime.strptime(ann["ei_time"], "%Y-%m-%d %H:%M:%S")
             except (ValueError, KeyError):
-                pass
+                continue
+            age = (now - ei).total_seconds() / 60
+            if age < 0 or age > ANNOUNCE_WINDOW_MIN:
+                continue
+            art_code = ann.get("art_code", ann["title"])
+            dedup_key = f"ann_{art_code}"
+            if is_pushed(state, dedup_key):
+                continue
+            source_tag = f"[{ann.get('source', '')}]" if ann.get("source") else ""
+            signals.append(f"**重要公告**{source_tag}：{ann['title']}")
+            mark_pushed(state, dedup_key)
+
+    # 7. 当天龙虎榜上榜（TRADE_DATE == 今天，且未推送过）
+    if dragon_tiger:
+        today_str = now.strftime("%Y-%m-%d")
+        for item in dragon_tiger:
+            if item["date"] != today_str:
+                continue
+            lhb_key = f"lhb_{stock_code}_{item['date']}"
+            if is_pushed(state, lhb_key):
+                continue
+            net = item.get("net_buy", 0)
+            net_str = f"净买入{abs(net)/1e8:.2f}亿" if net >= 0 else f"净卖出{abs(net)/1e8:.2f}亿"
+            signals.append(f"**龙虎榜上榜**：{item.get('reason', '')}，{net_str}")
+            mark_pushed(state, lhb_key)
 
     return signals
 
@@ -403,7 +523,6 @@ def send_serverchan(title, desp):
     if not SENDKEY:
         print("  [INFO] 未配置 SENDKEY，跳过推送")
         return False
-
     url = f"https://sctapi.ftqq.com/{SENDKEY}.send"
     data = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
     try:
@@ -413,9 +532,8 @@ def send_serverchan(title, desp):
         if result.get("code") == 0:
             print(f"  [OK] Server酱推送成功")
             return True
-        else:
-            print(f"  [ERROR] Server酱推送失败: {result}")
-            return False
+        print(f"  [ERROR] Server酱推送失败: {result}")
+        return False
     except Exception as e:
         print(f"  [ERROR] Server酱推送异常: {e}")
         return False
@@ -426,11 +544,7 @@ def send_wecom(content):
     if not WECOM_WEBHOOK:
         print("  [INFO] 未配置 WECOM_WEBHOOK，跳过企业微信推送")
         return False
-
-    payload = json.dumps({
-        "msgtype": "markdown",
-        "markdown": {"content": content},
-    }).encode("utf-8")
+    payload = json.dumps({"msgtype": "markdown", "markdown": {"content": content}}).encode("utf-8")
     try:
         req = urllib.request.Request(WECOM_WEBHOOK, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -439,121 +553,72 @@ def send_wecom(content):
         if result.get("errcode") == 0:
             print(f"  [OK] 企业微信推送成功")
             return True
-        else:
-            print(f"  [ERROR] 企业微信推送失败: {result}")
-            return False
+        print(f"  [ERROR] 企业微信推送失败: {result}")
+        return False
     except Exception as e:
         print(f"  [ERROR] 企业微信推送异常: {e}")
         return False
 
 
-def format_stock_block(stock_name, stock_code, quote, signals, fund_flow, vol_ratio):
-    """格式化单只股票的异动块"""
-    price = quote["current"]
-    chg = quote["change_pct"]
-    market_prefix = stock_code[:2]
-    display_code = stock_code[2:]
-
-    r = f"### {stock_name}({market_prefix}{display_code}) {price:.2f}元({chg:+.2f}%)\n"
-    for i, s in enumerate(signals, 1):
-        r += f"{i}. {s}\n"
-
-    parts = []
-    if fund_flow:
-        net = fund_flow["main_net"] / 1e8
-        color = "info" if net >= 0 else "warning"
-        parts.append(f"主力<font color=\"{color}\">{net:+.2f}亿</font>")
-    if vol_ratio:
-        parts.append(f"量比{vol_ratio:.1f}")
-    parts.append(f"成交额{quote['amount']/1e8:.1f}亿")
-    r += " | ".join(parts) + "\n\n"
-    return r
-
-
-def format_report_wecom(results):
-    """格式化合并推送内容"""
+def format_trade_report(results):
+    """格式化实时交易异动推送内容"""
     now_str = datetime.now().strftime("%H:%M")
-    r = f"## 股票异动提醒（{len(results)}只）\n"
-    r += f"时间：{now_str}\n\n"
+    r = f"## 实时异动提醒（{len(results)}只）\n时间：{now_str}\n\n"
     for item in results:
-        r += format_stock_block(
-            item["name"], item["code"], item["quote"],
-            item["signals"], item["fund_flow"], item["vol_ratio"]
-        )
+        q = item["quote"]
+        r += f"### {item['name']}({item['code']}) {q['current']:.2f}元({q['change_pct']:+.2f}%)\n"
+        for i, s in enumerate(item["signals"], 1):
+            r += f"{i}. {s}\n"
+        parts = []
+        if item["fund_flow"]:
+            net = item["fund_flow"]["main_net"] / 1e8
+            color = "info" if net >= 0 else "warning"
+            parts.append(f"主力<font color=\"{color}\">{net:+.2f}亿</font>")
+        if item["vol_ratio"]:
+            parts.append(f"量比{item['vol_ratio']:.1f}")
+        parts.append(f"成交额{q['amount']/1e8:.1f}亿")
+        r += " | ".join(parts) + "\n\n"
     return r
+
+
+def format_news_report(results):
+    """格式化消息面异动推送内容"""
+    now_str = datetime.now().strftime("%m-%d %H:%M")
+    r = f"## 公告/龙虎榜提醒（{len(results)}只）\n时间：{now_str}\n\n"
+    for item in results:
+        r += f"### {item['name']}({item['code']})\n"
+        for i, s in enumerate(item["signals"], 1):
+            r += f"{i}. {s}\n"
+        r += "\n"
+    return r
+
+
+def push(title, report):
+    """推送：企业微信优先，Server酱兜底"""
+    pushed = False
+    if WECOM_WEBHOOK:
+        pushed = send_wecom(report)
+    if not pushed and SENDKEY:
+        send_serverchan(title, report)
+    if not WECOM_WEBHOOK and not SENDKEY:
+        print("  [WARN] 未配置任何推送通道")
 
 
 # ============ 主流程 ============
 def is_trading_time():
-    """判断是否在交易时段"""
+    """判断是否在交易时段（交易日 9:00-15:30）"""
     now = datetime.now()
     if now.weekday() >= 5:
         return False, "周末"
     hm = now.hour * 100 + now.minute
-    if 925 <= hm <= 1135 or 1255 <= hm <= 1505:
+    if 900 <= hm <= 1530:
         return True, ""
     return False, "非交易时段"
 
 
-def monitor_one_stock(raw_code, stock_name, all_quotes):
-    """监控单只股票，返回包含异动的结果或None"""
-    market, code, secid = parse_code(raw_code)
-    symbol = market + code
-
-    print(f"\n  --- {stock_name}({raw_code}) ---")
-    quote = all_quotes.get(symbol)
-    if not quote:
-        print(f"  [WARN] 未获取到行情")
-        return None
-
-    print(f"  当前价: {quote['current']:.2f}元  涨跌幅: {quote['change_pct']:+.2f}%")
-
-    _time.sleep(0.3)
-    print("  [1/5] 获取K线历史...")
-    kline = get_sina_kline(market, code)
-
-    _time.sleep(0.3)
-    print("  [2/5] 获取资金流向...")
-    fund_flow = get_fund_flow(secid)
-
-    _time.sleep(0.3)
-    print("  [3/5] 获取历史资金流向...")
-    ff_history = get_fund_flow_history(secid)
-
-    _time.sleep(0.3)
-    print("  [4/5] 获取最新公告...")
-    announcements = get_announcements(code)
-
-    _time.sleep(0.3)
-    print("  [5/5] 检查龙虎榜...")
-    dragon_tiger = get_dragon_tiger(code)
-
-    vol_ratio = calc_volume_ratio(quote, kline)
-    if vol_ratio:
-        print(f"  量比(估): {vol_ratio:.2f}")
-    if fund_flow:
-        print(f"  主力净流入: {fund_flow['main_net']/1e8:+.2f}亿")
-
-    signals = analyze_signals(quote, fund_flow, ff_history, vol_ratio, announcements, dragon_tiger)
-    if signals:
-        print(f"  检测到 {len(signals)} 个异动信号")
-        for s in signals:
-            print(f"    - {s}")
-        return {
-            "name": stock_name,
-            "code": raw_code,
-            "quote": quote,
-            "fund_flow": fund_flow,
-            "vol_ratio": vol_ratio,
-            "signals": signals,
-        }
-    else:
-        print(f"  无明显异动")
-        return None
-
-
-def main():
-    print(f"=== 19只A股异动监控 ===")
+def run_trade_mode():
+    """实时交易监控模式"""
+    print(f"=== 实时交易监控（{len(STOCKS)}只）===")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     trading, reason = is_trading_time()
@@ -561,42 +626,109 @@ def main():
         print(f"  {reason}，跳过")
         return
 
-    # 批量获取所有股票实时行情
     print("\n  [批量] 获取实时行情(新浪)...")
     all_quotes = get_sina_quotes()
     if not all_quotes:
         print("  [ERROR] 无法获取行情数据，退出")
         return
+    print(f"  成功获取 {len(all_quotes)}/{len(STOCKS)} 只")
 
-    print(f"  成功获取 {len(all_quotes)}/{len(STOCKS)} 只股票行情")
-
-    # 逐只分析
     alerted = []
-    for raw_code, stock_name in STOCKS:
+    for raw_code, stock_name, _, _ in STOCKS:
         try:
-            result = monitor_one_stock(raw_code, stock_name, all_quotes)
-            if result:
-                alerted.append(result)
+            market, code, secid = parse_code(raw_code)
+            symbol = market + code
+            quote = all_quotes.get(symbol)
+            if not quote:
+                continue
+            print(f"\n  --- {stock_name}({raw_code}) {quote['current']:.2f}元({quote['change_pct']:+.2f}%) ---")
+            _time.sleep(0.3)
+            kline = get_sina_kline(market, code)
+            _time.sleep(0.3)
+            fund_flow = get_fund_flow(secid)
+            _time.sleep(0.3)
+            ff_history = get_fund_flow_history(secid)
+            vol_ratio = calc_volume_ratio(quote, kline)
+            signals = analyze_trade_signals(quote, fund_flow, ff_history, vol_ratio)
+            if signals:
+                print(f"  检测到 {len(signals)} 个异动信号")
+                alerted.append({
+                    "name": stock_name, "code": raw_code, "quote": quote,
+                    "fund_flow": fund_flow, "vol_ratio": vol_ratio, "signals": signals,
+                })
+            else:
+                print(f"  无异动")
         except Exception as e:
             print(f"  [ERROR] 处理 {raw_code} 异常: {e}")
-        _time.sleep(0.5)
+        _time.sleep(0.3)
 
-    # 推送
     print(f"\n  --- 汇总 ---")
     if alerted:
-        print(f"  共 {len(alerted)} 只股票触发异动")
-        report = format_report_wecom(alerted)
-
-        pushed = False
-        if WECOM_WEBHOOK:
-            pushed = send_wecom(report)
-        if not pushed and SENDKEY:
-            title = f"股票异动提醒（{len(alerted)}只）"
-            send_serverchan(title, report)
-        if not WECOM_WEBHOOK and not SENDKEY:
-            print("  [WARN] 未配置任何推送通道")
+        print(f"  共 {len(alerted)} 只触发实时异动")
+        push(f"实时异动提醒（{len(alerted)}只）", format_trade_report(alerted))
     else:
-        print(f"  19只股票均无异常")
+        print(f"  均无实时异动")
+
+
+def run_news_mode():
+    """公告/龙虎榜消息面监控模式（全天运行）"""
+    print(f"=== 公告/龙虎榜监控（{len(STOCKS)}只）===")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    state = prune_state(load_state())
+    new_state = False
+    alerted = []
+
+    for raw_code, stock_name, org_id, column in STOCKS:
+        try:
+            _, code, _ = parse_code(raw_code)
+            print(f"\n  --- {stock_name}({raw_code}) ---")
+            _time.sleep(0.3)
+            # 公告数据源1: 东方财富
+            em_anns = get_announcements_eastmoney(code)
+            _time.sleep(0.3)
+            # 公告数据源2: 巨潮资讯网（证监会指定信息披露平台）
+            cn_anns = get_announcements_cninfo(code, org_id, column)
+            _time.sleep(0.3)
+            # 合并去重
+            all_anns = merge_announcements(em_anns, cn_anns)
+            print(f"  公告: 东财{len(em_anns)}条 + 巨潮{len(cn_anns)}条 = 合并后{len(all_anns)}条")
+            # 龙虎榜
+            dragon_tiger = get_dragon_tiger(code)
+            signals = analyze_news_signals(all_anns, dragon_tiger, raw_code, state)
+            if signals:
+                print(f"  检测到 {len(signals)} 条消息")
+                new_state = True
+                alerted.append({"name": stock_name, "code": raw_code, "signals": signals})
+            else:
+                print(f"  无新消息")
+        except Exception as e:
+            print(f"  [ERROR] 处理 {raw_code} 异常: {e}")
+        _time.sleep(0.3)
+
+    print(f"\n  --- 汇总 ---")
+    if alerted:
+        print(f"  共 {len(alerted)} 只有新消息")
+        push(f"公告/龙虎榜提醒（{len(alerted)}只）", format_news_report(alerted))
+        new_state = True
+    else:
+        print(f"  无新消息")
+
+    if new_state:
+        save_state(state)
+
+
+def main():
+    mode = "trade"
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--mode" and i + 1 < len(args):
+            mode = args[i + 1]
+
+    if mode == "news":
+        run_news_mode()
+    else:
+        run_trade_mode()
 
 
 if __name__ == "__main__":
